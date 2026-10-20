@@ -1,0 +1,26 @@
+---
+page_title: "{{.Name}} {{.Type}} - {{.ProviderName}}"
+subcategory: ""
+description: |-
+{{ .Description | plainmarkdown | trimspace | prefixlines "  " }}
+---
+
+# {{.Name}} ({{.Type}})
+
+{{ .Description | trimspace }}
+
+Records are updated in place. Only a change of `zone_id` creates a new record.
+If a record is deleted outside Terraform, the next plan creates it again.
+
+## Example Usage
+
+{{ tffile .ExampleFile }}
+
+{{ .SchemaMarkdown | trimspace }}
+
+## Import
+
+Import an existing record with `<zone_id>/<record_id>`. You find both IDs in the
+[ConnByte](https://connbyte.com/) customer area or with the `connbyte_dns_zone` data source and the API.
+
+{{ codefile "shell" .ImportFile }}
