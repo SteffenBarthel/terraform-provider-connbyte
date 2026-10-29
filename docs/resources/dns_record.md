@@ -23,6 +23,10 @@ deleted, its records are removed from the state.
 - Control characters such as line breaks are not allowed in `content`.
 - Read requests are retried a few times on temporary API errors (5xx, rate limit). Create, update
   and delete requests are not retried.
+- If the connection breaks after a create request was sent, the record may exist in ConnByte but
+  not in the state. The provider does not retry the create, so no duplicate is made. Check the
+  record list in the [ConnByte](https://connbyte.com/) customer area and import the record, or
+  delete it there, before you apply again.
 
 ## Example Usage
 
