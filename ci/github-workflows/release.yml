@@ -1,5 +1,7 @@
 # Runs only when a version tag (v*) is pushed. Needs the repository secrets GPG_PRIVATE_KEY and
 # PASSPHRASE. The Terraform and OpenTofu registries verify the signature with the public key.
+# Protect v* tags (tag protection rule) or put the GPG secrets into a GitHub environment with a
+# required reviewer, so only the owner can trigger a signed release.
 name: Release
 
 on:
@@ -20,7 +22,8 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: 'go.mod'
-          cache: true
+          # No cache in the release job: a cache from another branch must not reach a signed build.
+          cache: false
       - name: Import GPG key
         uses: crazy-max/ghaction-import-gpg@2dc316deee8e90f13e1a351ab510b4d5bc0c82cd # v7.0.0
         id: import_gpg
@@ -30,6 +33,7 @@ jobs:
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
+          version: v2.19.0
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
