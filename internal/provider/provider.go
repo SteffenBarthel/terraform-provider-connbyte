@@ -3,6 +3,9 @@ package provider
 
 import (
 	"context"
+	"fmt"
+	"net"
+	"net/url"
 	"os"
 
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
@@ -53,7 +56,7 @@ func (p *connbyteProvider) Schema(_ context.Context, _ provider.SchemaRequest, r
 				Sensitive:           true,
 			},
 			"api_url": schema.StringAttribute{
-				MarkdownDescription: "Base URL of the ConnByte API. Defaults to `" + client.DefaultBaseURL + "`. Can also be set with the `" + envAPIURL + "` environment variable.",
+				MarkdownDescription: "Base URL of the ConnByte API. Defaults to `" + client.DefaultBaseURL + "`. Must use `https` (plain `http` only for `localhost`). Can also be set with the `" + envAPIURL + "` environment variable.",
 				Optional:            true,
 			},
 		},
@@ -94,9 +97,43 @@ func (p *connbyteProvider) Configure(ctx context.Context, req provider.Configure
 		return
 	}
 
+	if err := checkAPIURL(baseURL); err != nil {
+		resp.Diagnostics.AddAttributeError(path.Root("api_url"), "Invalid ConnByte API URL", err.Error())
+		return
+	}
+
 	c := client.New(baseURL, token, "terraform-provider-connbyte/"+p.version)
 	resp.DataSourceData = c
 	resp.ResourceData = c
+}
+
+// checkAPIURL allows only https, so the token is never sent in clear text. Plain http is accepted
+// for localhost only (tests and local development).
+func checkAPIURL(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return fmt.Errorf("%q is not a valid URL, for example %s", raw, client.DefaultBaseURL)
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("%q must not contain user info, a query or a fragment", raw)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		host := u.Hostname()
+		if host == "localhost" {
+			return nil
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+			return nil
+		}
+		return fmt.Errorf("%q uses http. Use https so the API token is not sent in clear text (http is allowed for localhost only)", raw)
+	}
+	return fmt.Errorf("%q must start with https://", raw)
 }
 
 func (p *connbyteProvider) Resources(_ context.Context) []func() resource.Resource {

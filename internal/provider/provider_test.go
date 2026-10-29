@@ -2,14 +2,18 @@ package provider
 
 import (
 	"fmt"
+	"net/http"
 	"regexp"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/terraform"
 
+	"github.com/SteffenBarthel/terraform-provider-connbyte/internal/client"
 	"github.com/SteffenBarthel/terraform-provider-connbyte/internal/mockapi"
 )
 
@@ -17,6 +21,10 @@ const testToken = "test-token"
 
 var protoV6ProviderFactories = map[string]func() (tfprotov6.ProviderServer, error){
 	"connbyte": providerserver.NewProtocol6WithError(New("test")()),
+}
+
+func init() {
+	client.DefaultRetryWait = time.Millisecond
 }
 
 // These tests run the real Terraform (or OpenTofu, via TF_ACC_TERRAFORM_PATH) binary against the
@@ -194,6 +202,112 @@ resource "connbyte_dns_record" "a" {
 	})
 }
 
+// TestDNSRecordFailures covers API errors and objects that disappear outside Terraform. It uses a
+// single resource so that injected API failures hit exactly that resource.
+func TestDNSRecordFailures(t *testing.T) {
+	m := mockapi.New(testToken)
+	defer m.Close()
+
+	longTXT := "v=DKIM1; k=rsa; p=" + strings.Repeat("MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A", 12)
+	recordIn := func(zoneID string) string {
+		return providerConfig(m) + fmt.Sprintf(`
+resource "connbyte_dns_record" "dkim" {
+  zone_id = %q
+  name    = "sel._domainkey"
+  type    = "TXT"
+  content = %q
+}
+`, zoneID, longTXT)
+	}
+	countDKIM := func(zoneID string, want int) resource.TestCheckFunc {
+		return func(_ *terraform.State) error {
+			if n := m.CountRecords(zoneID, "sel._domainkey."+zoneName(zoneID), "TXT"); n != want {
+				return fmt.Errorf("expected %d DKIM records in the API, got %d", want, n)
+			}
+			return nil
+		}
+	}
+
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: protoV6ProviderFactories,
+		CheckDestroy: func(_ *terraform.State) error {
+			if n := m.RecordCount(mockapi.ZoneExampleID); n != 2 {
+				return fmt.Errorf("expected only the 2 NS records after destroy, got %d", n)
+			}
+			return nil
+		},
+		Steps: []resource.TestStep{
+			{
+				// Read-back after create fails: the apply fails, the record exists in the API.
+				PreConfig:   func() { m.FailNext("/ns/record/list", http.StatusBadRequest, 1) },
+				Config:      recordIn(mockapi.ZoneExampleID),
+				ExpectError: regexp.MustCompile(`Cannot read ConnByte DNS record after create`),
+				Check:       countDKIM(mockapi.ZoneExampleID, 1),
+			},
+			{
+				// The tainted record is replaced, not created a second time. The long TXT value
+				// (split by the name server) must not cause a diff on the plan after apply.
+				Config: recordIn(mockapi.ZoneExampleID),
+				Check: resource.ComposeAggregateTestCheckFunc(
+					countDKIM(mockapi.ZoneExampleID, 1),
+					resource.TestCheckResourceAttr("connbyte_dns_record.dkim", "content", longTXT),
+				),
+			},
+			{
+				// A server error while reading is an error, not a deleted record.
+				PreConfig:   func() { m.FailNext("/ns/record/list", http.StatusInternalServerError, 4) },
+				Config:      recordIn(mockapi.ZoneExampleID),
+				PlanOnly:    true,
+				ExpectError: regexp.MustCompile(`Cannot read ConnByte DNS record`),
+			},
+			{
+				Config:   recordIn(mockapi.ZoneExampleID),
+				PlanOnly: true,
+				Check:    countDKIM(mockapi.ZoneExampleID, 1),
+			},
+			{
+				ResourceName:  "connbyte_dns_record.dkim",
+				ImportState:   true,
+				ImportStateId: "no-slash",
+				ExpectError:   regexp.MustCompile(`Expected "<zone_id>/<record_id>"`),
+			},
+			{
+				ResourceName:  "connbyte_dns_record.dkim",
+				ImportState:   true,
+				ImportStateId: mockapi.ZoneExampleID + "/abc",
+				ExpectError:   regexp.MustCompile(`is not a number`),
+			},
+			{
+				// Someone deletes the record between refresh and delete: destroy still succeeds.
+				PreConfig: m.VanishOnNextDelete,
+				Config:    providerConfig(m),
+				Check:     countDKIM(mockapi.ZoneExampleID, 0),
+			},
+			{
+				Config: recordIn(mockapi.ZoneOtherID),
+				Check:  countDKIM(mockapi.ZoneOtherID, 1),
+			},
+			{
+				// The whole zone is deleted outside Terraform: the record leaves the state.
+				PreConfig:          func() { m.DeleteZoneOutOfBand(mockapi.ZoneOtherID) },
+				Config:             recordIn(mockapi.ZoneOtherID),
+				PlanOnly:           true,
+				ExpectNonEmptyPlan: true,
+			},
+			{
+				Config: providerConfig(m),
+			},
+		},
+	})
+}
+
+func zoneName(zoneID string) string {
+	if zoneID == mockapi.ZoneOtherID {
+		return "other.net"
+	}
+	return "example.com"
+}
+
 // sameID fails when the record got a new ID, which means Terraform replaced it instead of updating it.
 func sameID(first *string) resource.CheckResourceAttrWithFunc {
 	return func(v string) error {
@@ -238,6 +352,10 @@ func TestDNSRecordValidation(t *testing.T) {
 				ExpectError: regexp.MustCompile(`MX preference belongs in priority`),
 			},
 			{
+				Config:      record(`name = "_dmarc"` + "\n" + `type = "TXT"` + "\n" + `content = "v=DMARC1;\nrua=x"`),
+				ExpectError: regexp.MustCompile(`must not contain control characters`),
+			},
+			{
 				Config: providerConfig(m),
 			},
 		},
@@ -261,6 +379,50 @@ func TestProviderMissingToken(t *testing.T) {
 			},
 		},
 	})
+}
+
+func TestProviderRejectsPlainHTTP(t *testing.T) {
+	resource.UnitTest(t, resource.TestCase{
+		ProtoV6ProviderFactories: protoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+provider "connbyte" {
+  api_url   = "http://api.connbyte.com"
+  api_token = "x"
+}
+data "connbyte_dns_zone" "x" { name = "example.com" }
+`,
+				ExpectError: regexp.MustCompile(`uses http`),
+			},
+			{
+				Config: `
+provider "connbyte" {
+  api_url   = "ftp://api.connbyte.com"
+  api_token = "x"
+}
+data "connbyte_dns_zone" "x" { name = "example.com" }
+`,
+				ExpectError: regexp.MustCompile(`must start with https://`),
+			},
+			{
+				Config: `provider "connbyte" {}`,
+			},
+		},
+	})
+}
+
+func TestCheckAPIURL(t *testing.T) {
+	for _, ok := range []string{"", "https://api.connbyte.com", "https://api.connbyte.com/", "http://localhost:8080", "http://127.0.0.1:1234", "http://[::1]:80"} {
+		if err := checkAPIURL(ok); err != nil {
+			t.Errorf("checkAPIURL(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"http://api.connbyte.com", "api.connbyte.com", "https://user:pw@api.connbyte.com", "https://api.connbyte.com/?x=1", "http://localhost.evil.com"} {
+		if err := checkAPIURL(bad); err == nil {
+			t.Errorf("checkAPIURL(%q) = nil, want error", bad)
+		}
+	}
 }
 
 func TestProviderEnvConfig(t *testing.T) {

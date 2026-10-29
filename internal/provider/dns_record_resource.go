@@ -20,6 +20,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 
 	"github.com/SteffenBarthel/terraform-provider-connbyte/internal/client"
 )
@@ -33,7 +34,10 @@ var (
 
 const defaultTTL = 3600
 
-var recordNamePattern = regexp.MustCompile(`^(@|\*|(\*\.)?[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?)*)$`)
+var (
+	recordNamePattern = regexp.MustCompile(`^(@|\*|(\*\.)?[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]*[a-z0-9_])?)*)$`)
+	noControlChars    = regexp.MustCompile(`^[^\x00-\x1f\x7f]*$`)
+)
 
 // NewDNSRecordResource returns the connbyte_dns_record resource.
 func NewDNSRecordResource() resource.Resource {
@@ -88,9 +92,12 @@ func (r *dnsRecordResource) Schema(_ context.Context, _ resource.SchemaRequest, 
 				Validators:          []validator.String{stringvalidator.OneOf(client.RecordTypes...)},
 			},
 			"content": schema.StringAttribute{
-				MarkdownDescription: "Record content, for example an IP address or a host name. For `MX` set only the mail server here and the preference in `priority`. For `SRV` use `weight port target` and set the priority in `priority`. For `TXT` give the text without quotes.",
+				MarkdownDescription: "Record content, for example an IP address or a host name. For `MX` set only the mail server here and the preference in `priority`. For `SRV` use `weight port target` and set the priority in `priority`. For `TXT` give the text without quotes; long values (over 255 characters, for example DKIM keys) are split by the name server and joined again by the provider. Control characters such as line breaks are not allowed.",
 				Required:            true,
-				Validators:          []validator.String{stringvalidator.LengthAtLeast(1)},
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+					stringvalidator.RegexMatches(noControlChars, "must not contain control characters such as line breaks or tabs"),
+				},
 			},
 			"ttl": schema.Int64Attribute{
 				MarkdownDescription: fmt.Sprintf("Time to live in seconds, between %d and %d. Defaults to `%d`.", client.MinTTL, client.MaxTTL, defaultTTL),
@@ -175,8 +182,10 @@ func (r *dnsRecordResource) Create(ctx context.Context, req resource.CreateReque
 		return
 	}
 	plan.ID = types.StringValue(strconv.FormatInt(id, 10))
-	// Save the ID first so a failed read-back does not leave an untracked record.
+	// Save ID and zone first so a failed read-back leaves a tainted resource that Terraform can
+	// still delete, instead of an untracked record that the next apply creates a second time.
 	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), plan.ID)...)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("zone_id"), plan.ZoneID)...)
 
 	rec, err := r.client.GetRecord(ctx, zone.ID, id)
 	if err != nil {
@@ -194,15 +203,16 @@ func (r *dnsRecordResource) Read(ctx context.Context, req resource.ReadRequest, 
 		return
 	}
 
-	recordID, err := strconv.ParseInt(state.ID.ValueString(), 10, 64)
-	if err != nil {
-		resp.Diagnostics.AddAttributeError(path.Root("id"), "Invalid record ID", fmt.Sprintf("%q is not a ConnByte record ID.", state.ID.ValueString()))
+	recordID, diags := stateIDs(state)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
 	zone, err := r.client.GetZone(ctx, state.ZoneID.ValueString())
 	if err != nil {
 		if client.IsNotFound(err) {
+			tflog.Info(ctx, "ConnByte DNS zone no longer exists, removing record from state", map[string]any{"zone_id": state.ZoneID.ValueString(), "id": state.ID.ValueString()})
 			resp.State.RemoveResource(ctx)
 			return
 		}
@@ -213,6 +223,7 @@ func (r *dnsRecordResource) Read(ctx context.Context, req resource.ReadRequest, 
 	rec, err := r.client.GetRecord(ctx, zone.ID, recordID)
 	if err != nil {
 		if client.IsNotFound(err) {
+			tflog.Info(ctx, "ConnByte DNS record no longer exists, removing it from state", map[string]any{"zone_id": zone.ID, "id": state.ID.ValueString()})
 			resp.State.RemoveResource(ctx)
 			return
 		}
@@ -232,9 +243,9 @@ func (r *dnsRecordResource) Update(ctx context.Context, req resource.UpdateReque
 		return
 	}
 
-	recordID, err := strconv.ParseInt(state.ID.ValueString(), 10, 64)
-	if err != nil {
-		resp.Diagnostics.AddAttributeError(path.Root("id"), "Invalid record ID", fmt.Sprintf("%q is not a ConnByte record ID.", state.ID.ValueString()))
+	recordID, diags := stateIDs(state)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
@@ -266,18 +277,36 @@ func (r *dnsRecordResource) Delete(ctx context.Context, req resource.DeleteReque
 		return
 	}
 
-	recordID, err := strconv.ParseInt(state.ID.ValueString(), 10, 64)
-	if err != nil {
-		resp.Diagnostics.AddAttributeError(path.Root("id"), "Invalid record ID", fmt.Sprintf("%q is not a ConnByte record ID.", state.ID.ValueString()))
+	recordID, diags := stateIDs(state)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	if err := r.client.DeleteRecord(ctx, state.ZoneID.ValueString(), recordID); err != nil {
-		if client.IsNotFound(err) {
-			return
-		}
+	err := r.client.DeleteRecord(ctx, state.ZoneID.ValueString(), recordID)
+	if client.IsNotFound(err) {
+		// The whole zone is gone, so the record is gone too.
+		return
+	}
+	if err != nil {
 		resp.Diagnostics.AddError("Cannot delete ConnByte DNS record", err.Error())
 	}
+}
+
+// stateIDs checks the IDs in the state. An empty zone_id is never sent to the API, because the
+// API would answer "zone not found" and the record would look deleted although it still exists.
+func stateIDs(m dnsRecordModel) (int64, diag.Diagnostics) {
+	var diags diag.Diagnostics
+	if m.ZoneID.IsNull() || m.ZoneID.IsUnknown() || m.ZoneID.ValueString() == "" {
+		diags.AddAttributeError(path.Root("zone_id"), "Missing zone ID in state",
+			fmt.Sprintf("The state of record %q has no zone_id. Remove it with \"terraform state rm\" and import it again with \"<zone_id>/<record_id>\".", m.ID.ValueString()))
+		return 0, diags
+	}
+	recordID, err := strconv.ParseInt(m.ID.ValueString(), 10, 64)
+	if err != nil {
+		diags.AddAttributeError(path.Root("id"), "Invalid record ID", fmt.Sprintf("%q is not a ConnByte record ID.", m.ID.ValueString()))
+	}
+	return recordID, diags
 }
 
 // ImportState accepts "<zone_id>/<record_id>".
