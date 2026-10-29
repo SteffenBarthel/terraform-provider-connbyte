@@ -10,7 +10,19 @@ description: |-
 Manages a DNS record in a zone hosted at [ConnByte](https://connbyte.com/).
 
 Records are updated in place. Only a change of `zone_id` creates a new record.
-If a record is deleted outside Terraform, the next plan creates it again.
+If a record is deleted outside Terraform, the next plan creates it again. If the whole zone is
+deleted, its records are removed from the state.
+
+## Notes
+
+- `name` is relative to the zone and must be lower case (DNS names are case-insensitive, the API
+  stores them in lower case). Use `@` for the zone apex. Do not include the zone name.
+- `TXT` values longer than 255 characters (for example DKIM keys) are stored by the name server as
+  several strings, such as `"part1" "part2"`. The provider joins them again, so give the full value
+  without quotes and without splitting it yourself.
+- Control characters such as line breaks are not allowed in `content`.
+- Read requests are retried a few times on temporary API errors (5xx, rate limit). Create, update
+  and delete requests are not retried.
 
 ## Example Usage
 
@@ -48,7 +60,7 @@ resource "connbyte_dns_record" "spf" {
 
 ### Required
 
-- `content` (String) Record content, for example an IP address or a host name. For `MX` set only the mail server here and the preference in `priority`. For `SRV` use `weight port target` and set the priority in `priority`. For `TXT` give the text without quotes.
+- `content` (String) Record content, for example an IP address or a host name. For `MX` set only the mail server here and the preference in `priority`. For `SRV` use `weight port target` and set the priority in `priority`. For `TXT` give the text without quotes; long values (over 255 characters, for example DKIM keys) are split by the name server and joined again by the provider. Control characters such as line breaks are not allowed.
 - `name` (String) Record name relative to the zone, in lower case. Use `@` for the zone apex, for example `www` or `_acme-challenge`.
 - `type` (String) Record type. One of `A`, `AAAA`, `CNAME`, `MX`, `NS`, `SRV`, `TXT`.
 - `zone_id` (String) ID of the zone, for example from the `connbyte_dns_zone` data source. Changing it creates a new record.
@@ -66,8 +78,10 @@ resource "connbyte_dns_record" "spf" {
 
 ## Import
 
-Import an existing record with `<zone_id>/<record_id>`. You find both IDs in the
-[ConnByte](https://connbyte.com/) customer area or with the `connbyte_dns_zone` data source and the API.
+Import an existing record with `<zone_id>/<record_id>`. The zone ID comes from the
+`connbyte_dns_zone` data source or the [ConnByte](https://connbyte.com/) customer area. The record ID
+is not part of the data source; take it from the customer area or from the record list of the
+ConnByte API (`POST /ns/record/list`).
 
 ```shell
 # Import an existing record with "<zone_id>/<record_id>".

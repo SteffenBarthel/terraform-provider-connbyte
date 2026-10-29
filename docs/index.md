@@ -44,4 +44,4 @@ variable "connbyte_api_token" {
 ### Optional
 
 - `api_token` (String, Sensitive) ConnByte API token. Can also be set with the `CONNBYTE_API_TOKEN` environment variable.
-- `api_url` (String) Base URL of the ConnByte API. Defaults to `https://api.connbyte.com`. Can also be set with the `CONNBYTE_API_URL` environment variable.
+- `api_url` (String) Base URL of the ConnByte API. Defaults to `https://api.connbyte.com`. Must use `https` (plain `http` only for `localhost`). Can also be set with the `CONNBYTE_API_URL` environment variable.
