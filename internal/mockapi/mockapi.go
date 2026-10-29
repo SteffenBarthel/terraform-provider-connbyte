@@ -18,17 +18,20 @@ type Server struct {
 	*httptest.Server
 	Token string
 
-	mu      sync.Mutex
-	zones   []zone
-	records map[string][]*record
-	nextID  int64
-	calls   []Call
+	mu             sync.Mutex
+	zones          []zone
+	records        map[string][]*record
+	nextID         int64
+	calls          []Call
+	failures       map[string][]int
+	vanishOnDelete bool
 }
 
 // Call is one request the mock received.
 type Call struct {
-	Path string
-	Body map[string]any
+	Path   string
+	Body   map[string]any
+	Header http.Header
 }
 
 type zone struct {
@@ -64,8 +67,9 @@ func New(token string) *Server {
 			{ID: ZoneExampleID, ProjectID: ProjectID, Zone: "example.com", CreatedAt: "2026-04-05T21:43:40.000Z"},
 			{ID: ZoneOtherID, ProjectID: ProjectID, Title: "Other", Zone: "other.net", CreatedAt: "2026-04-05T21:43:40.000Z"},
 		},
-		records: map[string][]*record{},
-		nextID:  435,
+		records:  map[string][]*record{},
+		nextID:   435,
+		failures: map[string][]int{},
 	}
 	s.records[ZoneExampleID] = []*record{
 		{ID: 1, Name: "example.com", Type: "NS", Content: "ns.connbyte.com", TTL: 86400},
@@ -96,13 +100,63 @@ func (s *Server) RecordCount(zoneID string) int {
 func (s *Server) DeleteRecordOutOfBand(zoneID string, id int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	recs := s.records[zoneID]
-	for i, r := range recs {
-		if r.ID == id {
-			s.records[zoneID] = append(recs[:i], recs[i+1:]...)
-			return
+	s.removeRecord(zoneID, id)
+}
+
+// DeleteZoneOutOfBand removes a zone and its records without going through the API.
+func (s *Server) DeleteZoneOutOfBand(zoneID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.zones {
+		if s.zones[i].ID == zoneID {
+			s.zones = append(s.zones[:i], s.zones[i+1:]...)
+			break
 		}
 	}
+	delete(s.records, zoneID)
+}
+
+// FailNext makes the next n requests to path fail with the given HTTP status.
+func (s *Server) FailNext(path string, code, n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for range n {
+		s.failures[path] = append(s.failures[path], code)
+	}
+}
+
+// VanishOnNextDelete removes the record of the next delete request just before the request is
+// handled, as if someone else deleted it between refresh and apply.
+func (s *Server) VanishOnNextDelete() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.vanishOnDelete = true
+}
+
+// CallCount returns the number of requests to path.
+func (s *Server) CallCount(path string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, c := range s.calls {
+		if c.Path == path {
+			n++
+		}
+	}
+	return n
+}
+
+// CountRecords returns the number of records with the given fully qualified name and type.
+func (s *Server) CountRecords(zoneID, fqdn, typ string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, r := range s.records[zoneID] {
+		if r.Name == fqdn && r.Type == typ {
+			n++
+		}
+	}
+	return n
 }
 
 // FindRecord returns a copy of the record with the given fully qualified name and type.
@@ -133,6 +187,10 @@ func status(code int, path string) map[string]any {
 	switch code {
 	case http.StatusBadRequest:
 		title, msg = "Bad Request", "Transferred data are incorrect."
+	case http.StatusUnauthorized:
+		title, msg = "Unauthorized", "Authentication failed."
+	case http.StatusInternalServerError:
+		title, msg = "Internal Server Error", "An error occurred."
 	case http.StatusForbidden:
 		title, msg = "Forbidden", "Access denied."
 	case http.StatusNotFound:
@@ -172,10 +230,16 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.calls = append(s.calls, Call{Path: r.URL.Path, Body: b})
+	s.calls = append(s.calls, Call{Path: r.URL.Path, Body: b, Header: r.Header.Clone()})
 
+	// The real API answers 401 without a field list for a missing or wrong token.
 	if r.Header.Get("Authorization") != "Bearer "+s.Token {
-		fail(http.StatusBadRequest, "authorization", "'Authorization' must be set.")
+		fail(http.StatusUnauthorized, "", "")
+		return
+	}
+	if q := s.failures[r.URL.Path]; len(q) > 0 {
+		s.failures[r.URL.Path] = q[1:]
+		fail(q[0], "", "")
 		return
 	}
 	if r.Method != http.MethodPost {
@@ -247,6 +311,10 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request) {
 			fail(http.StatusBadRequest, "recordId", "Field must be an integer.")
 			return
 		}
+		if s.vanishOnDelete {
+			s.vanishOnDelete = false
+			s.removeRecord(z.ID, id)
+		}
 		recs := s.records[z.ID]
 		for i, rec := range recs {
 			if rec.ID == id {
@@ -268,6 +336,16 @@ func (s *Server) zone(id string) *zone {
 		}
 	}
 	return nil
+}
+
+func (s *Server) removeRecord(zoneID string, id int64) {
+	recs := s.records[zoneID]
+	for i, r := range recs {
+		if r.ID == id {
+			s.records[zoneID] = append(recs[:i], recs[i+1:]...)
+			return
+		}
+	}
 }
 
 func (s *Server) record(zoneID string, id int64) *record {
@@ -316,13 +394,30 @@ func (s *Server) parseRecord(z *zone, b map[string]any) (*record, string, string
 		fqdn = strings.ToLower(name) + "." + z.Zone
 	}
 	if typ == "TXT" {
-		content = strconv.Quote(content)
+		content = quoteTXT(content)
 	}
 	dis := int64(0)
 	if disabled {
 		dis = 1
 	}
 	return &record{Name: fqdn, Type: typ, Content: content, TTL: ttl, Priority: prio, Disabled: dis}, "", ""
+}
+
+// quoteTXT stores TXT content like a name server in zone file notation: quoted strings of at most
+// 255 bytes, separated by a space, with '"' and '\' escaped.
+func quoteTXT(s string) string {
+	var parts []string
+	for len(s) > 255 {
+		parts = append(parts, s[:255])
+		s = s[255:]
+	}
+	parts = append(parts, s)
+	for i, p := range parts {
+		p = strings.ReplaceAll(p, `\`, `\\`)
+		p = strings.ReplaceAll(p, `"`, `\"`)
+		parts[i] = `"` + p + `"`
+	}
+	return strings.Join(parts, " ")
 }
 
 func toInt(v any) (int64, error) {
