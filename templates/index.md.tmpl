@@ -1,0 +1,23 @@
+---
+page_title: "Provider: ConnByte"
+description: |-
+  Manage DNS zones and records at ConnByte with Terraform or OpenTofu.
+---
+
+# ConnByte Provider
+
+The ConnByte provider manages DNS records for domains hosted at [ConnByte](https://connbyte.com/).
+It talks to the ConnByte API (`https://api.connbyte.com`).
+
+Works with Terraform and [OpenTofu](https://opentofu.org/).
+
+## Authentication
+
+Create an API token in your [ConnByte](https://connbyte.com/) account. Pass it with `api_token`
+or the `CONNBYTE_API_TOKEN` environment variable. Do not commit the token to version control.
+
+## Example Usage
+
+{{ tffile "examples/provider/provider.tf" }}
+
+{{ .SchemaMarkdown | trimspace }}
